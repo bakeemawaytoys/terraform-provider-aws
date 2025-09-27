@@ -3998,6 +3998,28 @@ func findIPAMPoolAllocationsByIPAMPoolIDAndResourceID(ctx context.Context, conn 
 	}), nil
 }
 
+func findIPAMPoolAllocationsForResource(ctx context.Context, conn *ec2.Client, ipamPoolID string, resourceType awstypes.IpamPoolAllocationResourceType, resourceId string) ([]awstypes.IpamPoolAllocation, error) {
+	input := &ec2.GetIpamPoolAllocationsInput{
+		IpamPoolId: aws.String(ipamPoolID),
+	}
+
+	output, err := findIPAMPoolAllocations(ctx, conn, input)
+
+	if err != nil {
+		return nil, err
+	}
+
+	output = tfslices.Filter(output, func(v awstypes.IpamPoolAllocation) bool {
+		return v.ResourceType == resourceType && aws.ToString(v.ResourceId) == resourceId
+	})
+
+	if len(output) == 0 {
+		return nil, &retry.NotFoundError{}
+	}
+
+	return output, nil
+}
+
 func findIPAMPoolCIDR(ctx context.Context, conn *ec2.Client, input *ec2.GetIpamPoolCidrsInput) (*awstypes.IpamPoolCidr, error) {
 	output, err := findIPAMPoolCIDRs(ctx, conn, input)
 
@@ -4089,6 +4111,30 @@ func findIPAMPoolCIDRByPoolCIDRIDAndPoolID(ctx context.Context, conn *ec2.Client
 			Message:     string(state),
 			LastRequest: &input,
 		}
+	}
+
+	return output, nil
+}
+
+func findIPAMResourceCIDRs(ctx context.Context, conn *ec2.Client, input *ec2.GetIpamResourceCidrsInput) ([]awstypes.IpamResourceCidr, error) {
+	var output []awstypes.IpamResourceCidr
+
+	pages := ec2.NewGetIpamResourceCidrsPaginator(conn, input)
+	for pages.HasMorePages() {
+		page, err := pages.NextPage(ctx)
+
+		if tfawserr.ErrCodeEquals(err, errCodeInvalidIPAMScopeIdNotFound) {
+			return nil, &retry.NotFoundError{
+				LastError:   err,
+				LastRequest: &input,
+			}
+		}
+
+		if err != nil {
+			return nil, err
+		}
+
+		output = append(output, page.IpamResourceCidrs...)
 	}
 
 	return output, nil

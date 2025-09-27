@@ -41,7 +41,8 @@ func resourceIPAMPool() *schema.Resource {
 		},
 
 		Timeouts: &schema.ResourceTimeout{
-			Create: schema.DefaultTimeout(3 * time.Minute),
+			//TODO Figure out what the new timeout should be
+			Create: schema.DefaultTimeout(3*time.Minute + ipamPoolResourceAllocationTimeout),
 			Update: schema.DefaultTimeout(3 * time.Minute),
 			Delete: schema.DefaultTimeout(3 * time.Minute),
 		},
@@ -138,6 +139,40 @@ func resourceIPAMPool() *schema.Resource {
 				Optional: true,
 				ForceNew: true,
 			},
+			"source_resource": {
+				Type:             schema.TypeList,
+				Optional:         true,
+				MaxItems:         1,
+				DiffSuppressFunc: verify.SuppressMissingOptionalConfigurationBlock,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						names.AttrResourceID: {
+							Type:     schema.TypeString,
+							ForceNew: true,
+							Required: true,
+						},
+						names.AttrResourceOwner: {
+							Type:         schema.TypeString,
+							ForceNew:     true,
+							Required:     true,
+							ValidateFunc: verify.ValidAccountID,
+						},
+						"resource_region": {
+							Type:         schema.TypeString,
+							ForceNew:     true,
+							Required:     true,
+							ValidateFunc: verify.ValidRegionName,
+						},
+						names.AttrResourceType: {
+							Type:             schema.TypeString,
+							Default:          awstypes.IpamPoolAllocationResourceTypeVpc,
+							ForceNew:         true,
+							Optional:         true,
+							ValidateDiagFunc: enum.Validate[awstypes.IpamPoolSourceResourceType](),
+						},
+					},
+				},
+			},
 			names.AttrState: {
 				Type:     schema.TypeString,
 				Computed: true,
@@ -213,6 +248,15 @@ func resourceIPAMPoolCreate(ctx context.Context, d *schema.ResourceData, meta an
 		input.SourceIpamPoolId = aws.String(v.(string))
 	}
 
+	if v, ok := d.GetOk("source_resource"); ok {
+		input.SourceResource = expandIpamPoolSourceResourceRequest(v.([]any))
+		//TODO Waiting for the resource to appear in the scope is very slow compared to checking for it in the source pool, but the source pool is optional
+		_, err := waitIPAMResourceInScope(ctx, conn, aws.ToString(input.IpamScopeId), aws.ToString(input.SourceResource.ResourceId), ipamPoolResourceAllocationTimeout)
+		if err != nil {
+			return sdkdiag.AppendErrorf(diags, "waiting for source resource to be in IPAM scope %s: %s", *input.IpamScopeId, err)
+		}
+	}
+
 	output, err := conn.CreateIpamPool(ctx, input)
 
 	if err != nil {
@@ -260,6 +304,17 @@ func resourceIPAMPoolRead(ctx context.Context, d *schema.ResourceData, meta any)
 	d.Set("source_ipam_pool_id", pool.SourceIpamPoolId)
 	d.Set(names.AttrState, pool.State)
 
+	if sourceResource := pool.SourceResource; sourceResource != nil {
+		tfmap := map[string]any{
+			names.AttrResourceID:    sourceResource.ResourceId,
+			names.AttrResourceOwner: sourceResource.ResourceOwner,
+			"resource_region":       sourceResource.ResourceRegion,
+			names.AttrResourceType:  sourceResource.ResourceType,
+		}
+		tflist := []map[string]any{tfmap}
+		d.Set("source_resource", tflist)
+	}
+
 	setTagsOut(ctx, pool.Tags)
 
 	return diags
@@ -269,7 +324,7 @@ func resourceIPAMPoolUpdate(ctx context.Context, d *schema.ResourceData, meta an
 	var diags diag.Diagnostics
 	conn := meta.(*conns.AWSClient).EC2Client(ctx)
 
-	if d.HasChangesExcept(names.AttrTags, names.AttrTagsAll) {
+	if d.HasChangesExcept(names.AttrTags, names.AttrTagsAll, "cascade") {
 		input := &ec2.ModifyIpamPoolInput{
 			IpamPoolId: aws.String(d.Id()),
 		}
@@ -381,4 +436,35 @@ func tagsFromIPAMAllocationTags(rts []awstypes.IpamResourceTag) []awstypes.Tag {
 	}
 
 	return tags
+}
+
+func expandIpamPoolSourceResourceRequest(tfList []any) *awstypes.IpamPoolSourceResourceRequest {
+	if len(tfList) == 0 {
+		return nil
+	}
+
+	tfMap, ok := tfList[0].(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	request := &awstypes.IpamPoolSourceResourceRequest{}
+
+	if v, ok := tfMap[names.AttrResourceID].(string); ok {
+		request.ResourceId = aws.String(v)
+	}
+
+	if v, ok := tfMap[names.AttrResourceOwner].(string); ok {
+		request.ResourceOwner = aws.String(v)
+	}
+
+	if v, ok := tfMap["resource_region"].(string); ok {
+		request.ResourceRegion = aws.String(v)
+	}
+
+	if v, ok := tfMap[names.AttrResourceType].(string); ok {
+		request.ResourceType = awstypes.IpamPoolSourceResourceType(v)
+	}
+
+	return request
 }

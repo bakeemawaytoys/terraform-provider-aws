@@ -29,6 +29,8 @@ const (
 	instanceStartTimeout                               = 10 * time.Minute
 	instanceStopTimeout                                = 10 * time.Minute
 	internetGatewayNotFoundChecks                      = 1000 // Should exceed any reasonable custom timeout value.
+	ipamPoolResourceAllocationTimeout                  = 35 * time.Minute
+	ipamPoolResourceDeallocationTimeout                = 35 * time.Minute // IPAM eventual consistency. It can take ~30 min to release allocations.
 	managedPrefixListEntryCreateTimeout                = 5 * time.Minute
 	managedPrefixListTimeout                           = 15 * time.Minute
 	networkInterfaceAttachedTimeout                    = 5 * time.Minute
@@ -961,6 +963,37 @@ func waitIPAMPoolUpdated(ctx context.Context, conn *ec2.Client, id string, timeo
 	}
 
 	return nil, err
+}
+
+func waitIPAMPoolResourceDeallocation(ctx context.Context, conn *ec2.Client, ipamPoolID string, resourceType awstypes.IpamPoolAllocationResourceType, resourceId string, timeout time.Duration) (any, error) {
+	return tfresource.RetryUntilNotFound(ctx, timeout, func(ctx context.Context) (any, error) {
+		return findIPAMPoolAllocationsForResource(ctx, conn, ipamPoolID, resourceType, resourceId)
+	})
+}
+
+func waitIPAMResourceInScope(ctx context.Context, conn *ec2.Client, ipamScopeID string, resourceId string, timeout time.Duration) (any, error) {
+	return tfresource.RetryWhenNotFound(ctx, timeout, func(ctx context.Context) (any, error) {
+		input := &ec2.GetIpamResourceCidrsInput{
+			IpamScopeId: aws.String(ipamScopeID),
+			ResourceId:  aws.String(resourceId),
+		}
+
+		output, err := findIPAMResourceCIDRs(ctx, conn, input)
+
+		if err != nil {
+			return nil, err
+		}
+		/*
+			output = tfslices.Filter(output, func(v awstypes.IpamResourceCidr) bool {
+				return v.ResourceType == resourceType && aws.ToString(v.ResourceId) == resourceId
+			})
+		*/
+		if len(output) == 0 {
+			return nil, &retry.NotFoundError{}
+		}
+
+		return output, nil
+	})
 }
 
 func waitIPAMResourceDiscoveryAssociationCreated(ctx context.Context, conn *ec2.Client, id string, timeout time.Duration) (*awstypes.IpamResourceDiscoveryAssociation, error) {

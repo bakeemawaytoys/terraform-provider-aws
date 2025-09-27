@@ -9,7 +9,6 @@ import (
 	"log"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -480,12 +479,7 @@ func resourceVPCDelete(ctx context.Context, d *schema.ResourceData, meta any) di
 		}
 	}
 	if ipamPoolID != "" && ipamPoolID != amazonIPv6PoolID {
-		const (
-			timeout = 35 * time.Minute // IPAM eventual consistency. It can take ~30 min to release allocations.
-		)
-		_, err := tfresource.RetryUntilNotFound(ctx, timeout, func(ctx context.Context) (any, error) {
-			return findIPAMPoolAllocationsForVPC(ctx, conn, ipamPoolID, d.Id())
-		})
+		_, err := waitIPAMPoolResourceDeallocation(ctx, conn, ipamPoolID, awstypes.IpamPoolAllocationResourceTypeVpc, d.Id(), ipamPoolResourceDeallocationTimeout)
 
 		if err != nil {
 			return sdkdiag.AppendErrorf(diags, "waiting for EC2 VPC (%s) IPAM Pool (%s) Allocation delete: %s", d.Id(), ipamPoolID, err)

@@ -21,10 +21,29 @@ import (
 	"github.com/hashicorp/terraform-provider-aws/internal/enum"
 	"github.com/hashicorp/terraform-provider-aws/internal/errs/sdkdiag"
 	"github.com/hashicorp/terraform-provider-aws/internal/logging"
+	tfslices "github.com/hashicorp/terraform-provider-aws/internal/slices"
 	tftags "github.com/hashicorp/terraform-provider-aws/internal/tags"
 	"github.com/hashicorp/terraform-provider-aws/internal/tfresource"
 	"github.com/hashicorp/terraform-provider-aws/internal/verify"
 	"github.com/hashicorp/terraform-provider-aws/names"
+)
+
+const (
+	subnetCIDRMaxIPv4Netmask  = 28
+	subnetCIDRMinIPv4Netmask  = 16
+	subnetCIDRMaxIPv6Netmask  = 60
+	subnetCIDRMinIPv6Netmask  = 44
+	subnetCIDRIPv6NetmaskStep = 4
+)
+
+var (
+	subnetCIDRValidIPv6Netmasks = tfslices.Range(subnetCIDRMinIPv6Netmask, subnetCIDRMaxIPv6Netmask+1, subnetCIDRIPv6NetmaskStep)
+	validSubnetIPv6CIDRBlock    = validation.All(
+		verify.ValidIPv6CIDRNetworkAddress,
+		validation.Any(tfslices.ApplyToAll(subnetCIDRValidIPv6Netmasks, func(v int) schema.SchemaValidateFunc {
+			return validation.IsCIDRNetwork(v, v)
+		})...),
+	)
 )
 
 // @SDKResource("aws_subnet", name="Subnet")
@@ -42,9 +61,12 @@ func resourceSubnet() *schema.Resource {
 		DeleteWithoutTimeout: resourceSubnetDelete,
 
 		Timeouts: &schema.ResourceTimeout{
-			Create: schema.DefaultTimeout(10 * time.Minute),
-			Delete: schema.DefaultTimeout(20 * time.Minute),
+			// TODO: Figure what the new timeout should be
+			Create: schema.DefaultTimeout(10*time.Minute + ipamPoolResourceAllocationTimeout),
+			Delete: schema.DefaultTimeout(20*time.Minute + ipamPoolResourceDeallocationTimeout),
 		},
+
+		CustomizeDiff: resourceSubnetCustomizeDiff,
 
 		SchemaVersion: 1,
 		MigrateState:  subnetMigrateState,
@@ -76,10 +98,12 @@ func resourceSubnet() *schema.Resource {
 				ConflictsWith: []string{names.AttrAvailabilityZone},
 			},
 			names.AttrCIDRBlock: {
-				Type:         schema.TypeString,
-				Optional:     true,
-				ForceNew:     true,
-				ValidateFunc: verify.ValidIPv4CIDRNetworkAddress,
+				Type:          schema.TypeString,
+				Optional:      true,
+				Computed:      true,
+				ForceNew:      true,
+				ValidateFunc:  verify.ValidIPv4CIDRNetworkAddress,
+				ConflictsWith: []string{"ipv4_netmask_length"},
 			},
 			"customer_owned_ipv4_pool": {
 				Type:         schema.TypeString,
@@ -106,14 +130,42 @@ func resourceSubnet() *schema.Resource {
 				Optional: true,
 				Default:  false,
 			},
+			"ipv4_ipam_pool_id": {
+				Type:          schema.TypeString,
+				Optional:      true,
+				ForceNew:      true,
+				ConflictsWith: []string{names.AttrCIDRBlock, "ipv6_native"},
+			},
+			"ipv4_netmask_length": {
+				Type:          schema.TypeInt,
+				Optional:      true,
+				ForceNew:      true,
+				ValidateFunc:  validation.IntBetween(subnetCIDRMinIPv4Netmask, subnetCIDRMaxIPv4Netmask),
+				ConflictsWith: []string{names.AttrCIDRBlock, "ipv6_native"},
+				RequiredWith:  []string{"ipv4_ipam_pool_id"},
+			},
 			"ipv6_cidr_block": {
-				Type:         schema.TypeString,
-				Optional:     true,
-				ValidateFunc: verify.ValidIPv6CIDRNetworkAddress,
+				Type:          schema.TypeString,
+				Optional:      true,
+				Computed:      true,
+				ConflictsWith: []string{"ipv6_netmask_length"},
+				RequiredWith:  []string{"ipv6_ipam_pool_id"},
+				ValidateFunc:  validSubnetIPv6CIDRBlock,
 			},
 			"ipv6_cidr_block_association_id": {
 				Type:     schema.TypeString,
 				Computed: true,
+			},
+			"ipv6_ipam_pool_id": {
+				Type:     schema.TypeString,
+				Optional: true,
+			},
+			"ipv6_netmask_length": {
+				Type:          schema.TypeInt,
+				Optional:      true,
+				ValidateFunc:  validation.IntInSlice(subnetCIDRValidIPv6Netmasks),
+				ConflictsWith: []string{"ipv6_cidr_block"},
+				RequiredWith:  []string{"ipv6_ipam_pool_id"},
 			},
 			"ipv6_native": {
 				Type:     schema.TypeBool,
@@ -179,12 +231,28 @@ func resourceSubnetCreate(ctx context.Context, d *schema.ResourceData, meta any)
 		input.CidrBlock = aws.String(v.(string))
 	}
 
+	if v, ok := d.GetOk("ipv4_ipam_pool_id"); ok {
+		input.Ipv4IpamPoolId = aws.String(v.(string))
+	}
+
+	if v, ok := d.GetOk("ipv4_netmask_length"); ok {
+		input.Ipv4NetmaskLength = aws.Int32(int32(v.(int)))
+	}
+
 	if v, ok := d.GetOk("ipv6_cidr_block"); ok {
 		input.Ipv6CidrBlock = aws.String(v.(string))
 	}
 
+	if v, ok := d.GetOk("ipv6_ipam_pool_id"); ok {
+		input.Ipv6IpamPoolId = aws.String(v.(string))
+	}
+
 	if v, ok := d.GetOk("ipv6_native"); ok {
 		input.Ipv6Native = aws.Bool(v.(bool))
+	}
+
+	if v, ok := d.GetOk("ipv6_netmask_length"); ok {
+		input.Ipv6NetmaskLength = aws.Int32(int32(v.(int)))
 	}
 
 	if v, ok := d.GetOk("outpost_arn"); ok {
@@ -380,6 +448,27 @@ func resourceSubnetDelete(ctx context.Context, d *schema.ResourceData, meta any)
 
 	if tfawserr.ErrCodeEquals(err, errCodeInvalidSubnetIDNotFound) {
 		return diags
+	}
+
+	// If the subnet's CIDR block was allocated from an IPAM pool, wait for the allocation to disappear.
+	var ipamPoolID string
+	if v, ok := d.GetOk("ipv4_ipam_pool_id"); ok {
+		ipamPoolID = v.(string)
+	}
+	if ipamPoolID == "" {
+		if v, ok := d.GetOk("ipv6_ipam_pool_id"); ok {
+			ipamPoolID = v.(string)
+		}
+	}
+	if ipamPoolID != "" {
+		const (
+			timeout = 35 * time.Minute // IPAM eventual consistency. It can take ~30 min to release allocations.
+		)
+		_, err := waitIPAMPoolResourceDeallocation(ctx, conn, ipamPoolID, awstypes.IpamPoolAllocationResourceTypeSubnet, d.Id(), timeout)
+
+		if err != nil {
+			return sdkdiag.AppendErrorf(diags, "waiting for EC2 subnet (%s) IPAM Pool (%s) Allocation delete: %s", d.Id(), ipamPoolID, err)
+		}
 	}
 
 	if err != nil {
@@ -677,6 +766,20 @@ func modifySubnetPrivateDNSHostnameTypeOnLaunch(ctx context.Context, conn *ec2.C
 
 	if _, err := waitSubnetPrivateDNSHostnameTypeOnLaunchUpdated(ctx, conn, subnetID, v); err != nil {
 		return fmt.Errorf("waiting for EC2 Subnet (%s) PrivateDnsHostnameTypeOnLaunch update: %w", subnetID, err)
+	}
+
+	return nil
+}
+
+func resourceSubnetCustomizeDiff(_ context.Context, diff *schema.ResourceDiff, v any) error {
+
+	// cidr_block can be set by a value returned from IPAM or explicitly in config.
+	if diff.Id() != "" && diff.HasChange(names.AttrCIDRBlock) {
+		// If netmask is set then cidr_block is derived from IPAM, ignore changes.
+		if diff.Get("ipv4_netmask_length") != 0 {
+			return diff.Clear(names.AttrCIDRBlock)
+		}
+		return diff.ForceNew(names.AttrCIDRBlock)
 	}
 
 	return nil
